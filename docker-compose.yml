@@ -1,0 +1,15 @@
+# OpenSteamTool TOML relay — independent from CloudActivate.
+# Only listens on host loopback; Baota site toml.nothingaming.com proxies to it.
+name: toml-relay
+
+services:
+  relay:
+    build: .
+    ports:
+      - "127.0.0.1:${TOML_RELAY_PORT:-8013}:8080"
+    volumes:
+      - toml-cache:/data
+    restart: unless-stopped
+
+volumes:
+  toml-cache:
