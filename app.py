@@ -7,7 +7,11 @@ GET /v2/{channel}/{component}/{sha256}.toml
 Cache semantics:
   - Only bodies that parse as a non-empty TOML table are cached or served.
     HTML/JSON/plain-text error pages from any upstream are skipped.
-  - Content is addressed by DLL SHA-256 and immutable -> one-year Cache-Control.
+  - Content is addressed by DLL SHA-256, but upstream sometimes adds entries to
+    an existing file (2026-09-13: two pattern/steamclient files, +5 lines each),
+    and the DLL refetches when a function is missing. So a cached file older
+    than REFRESH_AFTER is fetched again; if no source has it, the cached copy
+    is still served. Cache-Control matches that window.
   - Misses always answer 404 + no-store so the DLL moves straight to its own
     direct fallbacks (it never retries a 404) and edges never pin a miss.
 """
@@ -17,6 +21,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 import tomllib
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -42,7 +47,9 @@ UPSTREAMS = [
 PER_SOURCE_TIMEOUT = 4.0
 TOTAL_BUDGET = 8.0
 
-CACHE_CONTROL_200 = "public, max-age=31536000, immutable"
+# A cached file is served without asking upstream for this long.
+REFRESH_AFTER = 24 * 3600
+CACHE_CONTROL_200 = f"public, max-age={REFRESH_AFTER}"
 
 
 def is_usable_toml(body: bytes) -> bool:
@@ -98,15 +105,20 @@ def create_app(cache_dir: Path, transport: httpx.AsyncBaseTransport | None = Non
             raise HTTPException(status_code=404)
 
         cache_path = cache_dir / channel / component / f"{sha256}.toml"
+        stale = None
         try:
             cached = cache_path.read_bytes()
+            age = time.time() - cache_path.stat().st_mtime
         except FileNotFoundError:
             cached = None
         if cached is not None:
             if is_usable_toml(cached):
-                return _toml_response(cached, "hit")
-            log.warning("dropping unusable cache file %s", cache_path)
-            cache_path.unlink(missing_ok=True)
+                if age < REFRESH_AFTER:
+                    return _toml_response(cached, "hit")
+                stale = cached
+            else:
+                log.warning("dropping unusable cache file %s", cache_path)
+                cache_path.unlink(missing_ok=True)
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + TOTAL_BUDGET
@@ -127,9 +139,18 @@ def create_app(cache_dir: Path, transport: httpx.AsyncBaseTransport | None = Non
                     _write_atomic(cache_path, r.content)
                 except OSError as e:
                     log.warning("could not cache %s: %s", cache_path, e)
-                return _toml_response(r.content, "miss")
+                return _toml_response(r.content, "miss" if stale is None else "refreshed")
             last_err = f"{url} -> HTTP {r.status_code}" + (" (not TOML)" if r.status_code == 200 else "")
             log.info("upstream unusable: %s", last_err)
+
+        if stale is not None:
+            # Keep serving it, and wait another REFRESH_AFTER before asking upstream again.
+            log.info("refresh failed, serving cached %s (%s)", cache_path, last_err)
+            try:
+                os.utime(cache_path)
+            except OSError:
+                pass
+            return _toml_response(stale, "stale")
 
         raise HTTPException(status_code=404, detail=f"all sources failed ({last_err})")
 

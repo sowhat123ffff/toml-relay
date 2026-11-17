@@ -10,6 +10,7 @@ import importlib.util
 import os
 from pathlib import Path
 import tempfile
+import time
 
 import httpx
 
@@ -19,6 +20,7 @@ FAILED = 0
 
 SHA = "a" * 64
 GOOD = b"[0x82428E37]\nname = 'f'\nrva = '0x10'\n"
+UPDATED = GOOD + b"[0x1A2B3C4D]\nname = 'g'\nrva = '0x20'\n"
 HTML = b"<!doctype html><html><body>blocked</body></html>"
 
 
@@ -97,9 +99,9 @@ async def main():
         upstream.set((OWN_RAW, (200, GOOD)))
         r = await scenario(relay, root, upstream, lambda c: c.get(path))
         check("owned raw success returns TOML", r.status_code == 200 and r.content == GOOD)
-        check("success headers: text/plain, immutable 1y, miss",
+        check("success headers: text/plain, max-age 1 day (the refresh window), miss",
               r.headers["content-type"].startswith("text/plain")
-              and r.headers["cache-control"] == "public, max-age=31536000, immutable"
+              and r.headers["cache-control"] == "public, max-age=86400"
               and r.headers["x-relay-cache"] == "miss")
         check("first source success stops the chain", len(upstream.calls) == 1)
         check("success is cached atomically (no leftover .tmp)",
@@ -108,6 +110,49 @@ async def main():
         r = await scenario(relay, root, upstream, lambda c: c.get(path))
         check("second request is a cache hit without upstream calls",
               r.status_code == 200 and r.headers["x-relay-cache"] == "hit" and upstream.calls == [])
+
+        # Upstream adds entries to an existing SHA file (2026-09-13: +5 lines on two files).
+        def age_cache(seconds):
+            old = time.time() - seconds
+            os.utime(cache_file, (old, old))
+
+        refresh_after = relay.REFRESH_AFTER
+        age_cache(refresh_after + 60)
+        relay.REFRESH_AFTER = 10 ** 9  # control: a cache that is never refreshed (the old behaviour)
+        upstream.set((OWN_RAW, (200, UPDATED)))
+        r = await scenario(relay, root, upstream, lambda c: c.get(path))
+        check("control: without refresh, a day-old cache keeps the old file and asks no source",
+              r.status_code == 200 and r.content == GOOD and r.headers["x-relay-cache"] == "hit"
+              and upstream.calls == [])
+        relay.REFRESH_AFTER = refresh_after
+
+        age_cache(refresh_after - 60)
+        r = await scenario(relay, root, upstream, lambda c: c.get(path))
+        check("cache younger than the refresh window is a hit without upstream calls",
+              r.content == GOOD and r.headers["x-relay-cache"] == "hit" and upstream.calls == [])
+
+        age_cache(refresh_after + 60)
+        r = await scenario(relay, root, upstream, lambda c: c.get(path))
+        check("cache older than the window is fetched again: updated file served and cached",
+              r.status_code == 200 and r.content == UPDATED and r.headers["x-relay-cache"] == "refreshed"
+              and len(upstream.calls) == 1 and cache_file.read_bytes() == UPDATED
+              and time.time() - cache_file.stat().st_mtime < 60)
+
+        for label, rules in (("every source missing", ()),
+                             ("every source down", tuple((m, httpx.ConnectError("down")) for m in
+                                                         (OWN_RAW, OWN_CDN, AUTHOR_RAW, GH_PROXY))),
+                             ("HTML 200 from every source", tuple((m, (200, HTML)) for m in
+                                                                  (OWN_RAW, OWN_CDN, AUTHOR_RAW, GH_PROXY)))):
+            age_cache(refresh_after + 60)
+            upstream.set(*rules)
+            r = await scenario(relay, root, upstream, lambda c: c.get(path))
+            check(f"refresh fails ({label}) -> cached copy still served 200, unchanged",
+                  r.status_code == 200 and r.content == UPDATED and r.headers["x-relay-cache"] == "stale"
+                  and len(upstream.calls) == 4 and cache_file.read_bytes() == UPDATED)
+            upstream.set((OWN_RAW, (200, GOOD)))
+            r = await scenario(relay, root, upstream, lambda c: c.get(path))
+            check(f"after a failed refresh ({label}) the next one waits a full window",
+                  r.headers["x-relay-cache"] == "hit" and upstream.calls == [])
         cache_file.unlink()
 
         # Unusable 200 bodies are skipped, never cached, next source used.

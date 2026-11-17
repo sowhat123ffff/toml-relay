@@ -10,7 +10,7 @@ GET https://toml.nothingaming.com/v2/{channel}/{component}/{sha256}.toml
 
 - `channel` ∈ `pattern`、`ipc`；`component` ∈ `steamclient`、`steamui`；`sha256` 为 64 位小写十六进制。
 - `{sha256}` 是目标 Steam DLL 的 SHA-256，不是 TOML 正文的 SHA-256。
-- 200：`text/plain; charset=utf-8`，`Cache-Control: public, max-age=31536000, immutable`，`X-Relay-Cache: hit|miss`。
+- 200：`text/plain; charset=utf-8`，`Cache-Control: public, max-age=86400`，`X-Relay-Cache: hit|miss|refreshed|stale`。
 - 其它一切（未发布、参数非法、未知路径）：404 + `Cache-Control: no-store`。DLL 不重试 404，直接进入自己的直连回退。
 - `GET /health` → `{"status":"ok"}`。
 
@@ -21,6 +21,7 @@ GET https://toml.nothingaming.com/v2/{channel}/{component}/{sha256}.toml
 - 只有能解析为非空 TOML 表的正文才缓存和返回；任何上游返回的 HTML/JSON/纯文本错误页都跳过。
 - 单源超时 4 秒，整条链 8 秒预算，低于 DLL 10 秒接收超时，未命中时 DLL 收到快速 404 而不是超时再重试。
 - 缓存写入：同目录临时文件 + `os.replace`，不会留下截断文件；读取时再次校验，坏文件自动删除并重新回源。
+- 缓存超过 1 天（`REFRESH_AFTER`）就重新回源：上游会给同一个 SHA 的文件补条目（2026-09-13 有两个 `pattern/steamclient` 文件各加了 5 行），DLL 缺函数时会删掉本地缓存重下，中转不能一直给旧文件。回源拿到可用 TOML → 更新缓存，`refreshed`；全部失败 / 404 / 不是 TOML → 照样回旧缓存 200，`stale`，并再等 1 天才重试。`hit` 只表示 1 天内的缓存。
 - 缓存位于容器 `/data/cache`（命名卷 `toml-relay_toml-cache`），与任何其它项目隔离。
 
 ## 本地验证
